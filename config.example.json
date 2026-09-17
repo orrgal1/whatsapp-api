@@ -1,0 +1,7 @@
+{
+  "destination": "you@example.com",
+  "delivery": {
+    "type": "gapi",
+    "command": "gapi"
+  }
+}

@@ -1,0 +1,6 @@
+node_modules/
+.whatsapp-auth/
+config.json
+excluded-conversations.json
+.DS_Store
+*.log

@@ -1,0 +1,26 @@
+{
+  "name": "whatsapp-email-forwarder",
+  "version": "1.0.0",
+  "description": "Forward incoming WhatsApp messages to email from a local macOS service.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup": "node setup.mjs",
+    "start": "node forwarder.mjs",
+    "service:status": "node service.mjs status",
+    "service:uninstall": "node service.mjs uninstall"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc13",
+    "nodemailer": "^10.0.10",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "overrides": {
+    "protobufjs": "^7.5.5"
+  }
+}
