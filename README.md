@@ -13,6 +13,14 @@ A macOS-only background service that forwards incoming WhatsApp messages to emai
   - **gapi:** `gapi` installed and already authenticated for Gmail
   - **Gmail SMTP:** a Google Account with 2-Step Verification enabled and an [app password](https://support.google.com/accounts/answer/185833). Do not use your normal Google Account password.
 
+## One-line coding-harness setup
+
+Paste this into any coding harness:
+
+```text
+Set up https://github.com/orrgal1/whatsapp-email-forwarder on this Mac: clone it into a suitable local directory, run npm install and npm run setup, guide me through email configuration and WhatsApp QR pairing, verify the launchd service is running, and never expose or commit config.json, excluded-conversations.json, .whatsapp-auth, or logs.
+```
+
 ## Install and set up
 
 ```sh
