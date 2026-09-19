@@ -4,14 +4,17 @@ import makeWASocket, {
   getContentType,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
-import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
+import { createApiServer, ChatStore } from './api.mjs';
 const originalConsoleWarn = console.warn.bind(console);
 const originalConsoleInfo = console.info.bind(console);
 const suppressedSignalWarnings = new Set([
@@ -41,6 +44,145 @@ const versionPromise = fetchLatestBaileysVersion()
 const seen = new Set();
 let mailQueue = Promise.resolve();
 let pairingComplete = false;
+const chatStore = new ChatStore();
+let currentSock = null;
+let apiServer = null;
+function loadAuthLidMappings() {
+  try {
+    const files = readdirSync(AUTH_DIR);
+    let count = 0;
+    for (const file of files) {
+      if (file.startsWith('lid-mapping-') && file.endsWith('_reverse.json')) {
+        const lidNum = file.replace('lid-mapping-', '').replace('_reverse.json', '');
+        const lid = `${lidNum}@lid`;
+        try {
+          const raw = readFileSync(new URL(file, `file://${AUTH_DIR}/`), 'utf8');
+          const phone = JSON.parse(raw);
+          if (phone) {
+            const cleanPhone = String(phone).replace(/\D/g, '');
+            const jid = `${cleanPhone}@s.whatsapp.net`;
+            chatStore.recordLidMapping(lid, jid);
+            chatStore.recordContact({
+              id: lid,
+              phone: `+${cleanPhone}`,
+            });
+            chatStore.recordContact({
+              id: jid,
+              phone: `+${cleanPhone}`,
+            });
+            count++;
+          }
+        } catch {}
+      }
+    }
+    if (count > 0) {
+      console.log(`Loaded ${count} LID identity mappings from credentials.`);
+    }
+  } catch {}
+}
+loadAuthLidMappings();
+function normalizePhone(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return null;
+  if (raw.trim().startsWith('+')) {
+    return `+${digits}`;
+  }
+  if (digits.startsWith('0') && (digits.length === 9 || digits.length === 10)) {
+    return `+972${digits.slice(1)}`;
+  }
+  if (digits.startsWith('972')) {
+    return `+${digits}`;
+  }
+  return `+${digits}`;
+}
+
+function readAddressBookFromSqlite() {
+  if (process.platform !== 'darwin') return [];
+  const baseDir = path.join(os.homedir(), 'Library', 'Application Support', 'AddressBook');
+  const dbs = [];
+  const rootDb = path.join(baseDir, 'AddressBook-v22.abcddb');
+  if (existsSync(rootDb)) dbs.push(rootDb);
+
+  const sourcesDir = path.join(baseDir, 'Sources');
+  if (existsSync(sourcesDir)) {
+    try {
+      for (const s of readdirSync(sourcesDir)) {
+        const db = path.join(sourcesDir, s, 'AddressBook-v22.abcddb');
+        if (existsSync(db)) dbs.push(db);
+      }
+    } catch {}
+  }
+
+  const query = `
+    SELECT 
+      COALESCE(r.ZFIRSTNAME, ''), 
+      COALESCE(r.ZLASTNAME, ''), 
+      COALESCE(r.ZNICKNAME, ''), 
+      COALESCE(r.ZORGANIZATION, ''), 
+      p.ZFULLNUMBER 
+    FROM ZABCDRECORD r 
+    JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK 
+    WHERE p.ZFULLNUMBER IS NOT NULL;
+  `;
+
+  const contactsMap = new Map();
+  for (const db of dbs) {
+    try {
+      const output = execFileSync('/usr/bin/sqlite3', [db, '-separator', '\t', query], {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      for (const line of output.split('\n')) {
+        if (!line.trim()) continue;
+        const [first, last, nick, org, rawPhone] = line.split('\t');
+        const name = [first, last].filter(Boolean).join(' ') || nick || org;
+        if (!name || !rawPhone) continue;
+        const phone = normalizePhone(rawPhone);
+        if (!phone) continue;
+        contactsMap.set(phone, { name, phone });
+      }
+    } catch {}
+  }
+  return Array.from(contactsMap.values());
+}
+
+function loadMacAddressBookContacts() {
+  const cachePath = fileURLToPath(new URL('./contacts-cache.json', import.meta.url));
+  let contactsList = [];
+
+  if (existsSync(cachePath)) {
+    try {
+      contactsList = JSON.parse(readFileSync(cachePath, 'utf8'));
+    } catch {}
+  }
+
+  if (!Array.isArray(contactsList) || contactsList.length === 0) {
+    contactsList = readAddressBookFromSqlite();
+    if (contactsList.length > 0) {
+      try {
+        writeFileSync(cachePath, JSON.stringify(contactsList, null, 2), 'utf8');
+      } catch {}
+    }
+  }
+
+  let count = 0;
+  for (const item of contactsList) {
+    if (!item?.name || !item?.phone) continue;
+    const cleanDigits = item.phone.replace(/\D/g, '');
+    const jid = `${cleanDigits}@s.whatsapp.net`;
+    chatStore.recordContact({
+      id: jid,
+      name: item.name,
+      phone: item.phone,
+    });
+    count++;
+  }
+  if (count > 0) {
+    console.log(`Loaded ${count} contacts from AddressBook.`);
+  }
+}
+loadMacAddressBookContacts();
 
 function readJson(filename) {
   try {
@@ -64,31 +206,40 @@ function loadConfig() {
   const delivery = value.delivery;
   if (!delivery || typeof delivery !== 'object') throw new Error('config.delivery must be an object.');
 
+  let deliveryConfig;
   if (delivery.type === 'gapi') {
-    return {
-      destination,
-      delivery: { type: 'gapi', command: requireString(delivery.command, 'config.delivery.command') },
-    };
-  }
-  if (delivery.type === 'smtp') {
+    deliveryConfig = { type: 'gapi', command: requireString(delivery.command, 'config.delivery.command') };
+  } else if (delivery.type === 'smtp') {
     const port = Number(delivery.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error('config.delivery.port must be an integer from 1 to 65535.');
     }
     if (typeof delivery.secure !== 'boolean') throw new Error('config.delivery.secure must be a boolean.');
-    return {
-      destination,
-      delivery: {
-        type: 'smtp',
-        host: requireString(delivery.host, 'config.delivery.host'),
-        port,
-        secure: delivery.secure,
-        user: requireString(delivery.user, 'config.delivery.user'),
-        password: requireString(delivery.password, 'config.delivery.password'),
-      },
+    deliveryConfig = {
+      type: 'smtp',
+      host: requireString(delivery.host, 'config.delivery.host'),
+      port,
+      secure: delivery.secure,
+      user: requireString(delivery.user, 'config.delivery.user'),
+      password: requireString(delivery.password, 'config.delivery.password'),
     };
+  } else {
+    throw new Error('config.delivery.type must be "gapi" or "smtp".');
   }
-  throw new Error('config.delivery.type must be "gapi" or "smtp".');
+
+  const api = value.api && typeof value.api === 'object' ? {
+    enabled: value.api.enabled !== false,
+    port: Number(value.api.port) || 8080,
+    host: value.api.host || '127.0.0.1',
+    token: typeof value.api.token === 'string' ? value.api.token.trim() : '',
+  } : {
+    enabled: true,
+    port: 8080,
+    host: '127.0.0.1',
+    token: '',
+  };
+
+  return { destination, delivery: deliveryConfig, api };
 }
 
 function loadExcludedConversations() {
@@ -196,10 +347,26 @@ async function connect() {
     auth: state,
     logger,
     markOnlineOnConnect: false,
-    syncFullHistory: false,
+    syncFullHistory: true,
     browser: ['WhatsApp Forwarder', 'Chrome', '120.0'],
     getMessage: async () => ({ conversation: '' }),
   });
+  currentSock = sock;
+
+  if (!PAIR_ONLY && CONFIG.api?.enabled !== false && !apiServer) {
+    apiServer = createApiServer({
+      getSocket: () => currentSock,
+      token: CONFIG.api.token,
+      store: chatStore,
+      logger: console,
+    });
+    try {
+      await apiServer.listen(CONFIG.api.port, CONFIG.api.host);
+      console.log(`API server listening on http://${CONFIG.api.host}:${CONFIG.api.port} (OpenAPI: /openapi.json, Docs: /docs)`);
+    } catch (err) {
+      console.error(`Failed to start API server on port ${CONFIG.api.port}:`, err.message);
+    }
+  }
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
@@ -220,6 +387,8 @@ async function connect() {
       } else {
         console.log(`Connected. Forwarding incoming WhatsApp messages to ${CONFIG.destination}.`);
       }
+        sock.resyncAppState?.(['critical_unblock_low', 'regular_high', 'regular_low', 'critical_block', 'regular'], false)
+          ?.catch?.(() => {});
     }
     if (connection === 'close' && !pairingComplete) {
       const status = lastDisconnect?.error?.output?.statusCode;
@@ -234,6 +403,95 @@ async function connect() {
   });
 
   if (PAIR_ONLY) return;
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) {
+      if (!c?.id) continue;
+      chatStore.recordContact({
+        id: c.id,
+        name: c.name || '',
+        notify: c.notify || '',
+        verifiedName: c.verifiedName || '',
+      });
+    }
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    for (const c of updates) {
+      if (!c?.id) continue;
+      chatStore.recordContact({
+        id: c.id,
+        name: c.name || '',
+        notify: c.notify || '',
+        verifiedName: c.verifiedName || '',
+      });
+    }
+  });
+
+  sock.ev.on('chats.upsert', (chats) => {
+    for (const chat of chats) {
+      if (!chat?.id) continue;
+      const isGroup = chat.id.endsWith('@g.us');
+      chatStore.setChatMetadata(chat.id, {
+        name: chat.name || '',
+        isGroup,
+      });
+    }
+  });
+
+  sock.ev.on('chats.update', (updates) => {
+    for (const chat of updates) {
+      if (!chat?.id) continue;
+      chatStore.setChatMetadata(chat.id, {
+        name: chat.name || '',
+      });
+    }
+  });
+
+  sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        if (!c?.id) continue;
+        chatStore.recordContact({
+          id: c.id,
+          name: c.name || '',
+          notify: c.notify || '',
+          verifiedName: c.verifiedName || '',
+        });
+      }
+    }
+    if (Array.isArray(chats)) {
+      for (const chat of chats) {
+        if (!chat?.id) continue;
+        const isGroup = chat.id.endsWith('@g.us');
+        chatStore.setChatMetadata(chat.id, {
+          name: chat.name || '',
+          isGroup,
+        });
+      }
+    }
+    if (Array.isArray(messages)) {
+      for (const msg of messages) {
+        if (!msg?.key?.id) continue;
+        const chatId = msg.key.remoteJid || '';
+        if (!chatId || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
+        const senderId = msg.key.participant || chatId;
+        const sender = msg.pushName || senderId.replace(/@.*/, '');
+        const details = describe(msg.message);
+        const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
+        chatStore.recordMessage({
+          id: msg.key.id,
+          chatId,
+          senderId,
+          senderName: msg.key.fromMe ? 'Me' : sender,
+          fromMe: Boolean(msg.key.fromMe),
+          timestamp: timestamp.getTime(),
+          type: details.type,
+          text: details.text,
+          rawMessage: msg.message,
+        });
+      }
+    }
+  });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -241,9 +499,7 @@ async function connect() {
     for (const msg of messages) {
       const id = msg.key.id;
       const chatId = msg.key.remoteJid || '';
-      if (!id || seen.has(id) || msg.key.fromMe || !msg.message || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
-      seen.add(id);
-      if (seen.size > 5000) seen.delete(seen.values().next().value);
+      if (!id || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
 
       const senderId = msg.key.participant || chatId;
       const sender = msg.pushName || senderId.replace(/@.*/, '');
@@ -252,12 +508,31 @@ async function connect() {
       if (isGroup) {
         try { chat = (await sock.groupMetadata(chatId)).subject || chat; } catch {}
       }
+
+      const details = describe(msg.message);
+      const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
+
+      chatStore.recordMessage({
+        id,
+        chatId,
+        senderId,
+        senderName: msg.key.fromMe ? 'Me' : sender,
+        fromMe: Boolean(msg.key.fromMe),
+        timestamp: timestamp.getTime(),
+        type: details.type,
+        text: details.text,
+        rawMessage: msg.message,
+      });
+      chatStore.setChatMetadata(chatId, { name: chat, isGroup });
+
+      if (seen.has(id) || msg.key.fromMe || !msg.message) continue;
+      seen.add(id);
+      if (seen.size > 5000) seen.delete(seen.values().next().value);
+
       if (isExcludedConversation({ chatId, senderId, sender, chat })) {
         console.log(`Skipped excluded conversation ${chat}.`);
         continue;
       }
-      const details = describe(msg.message);
-      const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
       const subject = `WhatsApp from ${sender}${isGroup ? ` in ${chat}` : ''}`;
       const body = [
         `From: ${sender} (${senderId})`,

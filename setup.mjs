@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { constants as fsConstants, accessSync, readFileSync } from 'node:fs';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -115,6 +116,13 @@ async function main() {
       console.log('A value is required.');
     }
   };
+  const askEmail = async (label, defaultValue = '') => {
+    while (true) {
+      const answer = await askRequired(label, defaultValue);
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer)) return answer;
+      console.log('Enter a valid email address (e.g. you@example.com).');
+    }
+  };
   const askChoice = async (label, choices, defaultValue) => {
     while (true) {
       const answer = (await ask(`${label} (${choices.join('/')})`, defaultValue)).toLowerCase();
@@ -143,7 +151,7 @@ async function main() {
 
   console.log('WhatsApp Email Forwarder setup\n');
   try {
-    const destination = await askRequired('Destination email address', currentConfig.destination || '');
+    const destination = await askEmail('Forwarding email address', currentConfig.destination || '');
     const existingType = currentConfig.delivery?.type === 'smtp' ? 'smtp' : 'gapi';
     const deliveryType = await askChoice('Delivery method', ['gapi', 'smtp'], existingType);
     let delivery;
@@ -181,8 +189,31 @@ async function main() {
       'Excluded conversation IDs (comma-separated, exact matches)',
       displayList(currentExcluded.ids),
     ));
+    const enableApi = await askBoolean('Enable HTTP API for chat interactions', currentConfig.api?.enabled ?? true);
+    let api = null;
+    if (enableApi) {
+      const defaultPort = currentConfig.api?.port || 8080;
+      let apiPort;
+      while (!apiPort) {
+        const candidate = Number(await askRequired('HTTP API port', defaultPort));
+        if (Number.isInteger(candidate) && candidate >= 1 && candidate <= 65535) apiPort = candidate;
+        else console.log('Enter a port from 1 to 65535.');
+      }
+      const existingToken = currentConfig.api?.token || '';
+      const generatedToken = existingToken || crypto.randomBytes(24).toString('hex');
+      const apiToken = await ask('HTTP API Bearer token', generatedToken);
+      api = {
+        enabled: true,
+        port: apiPort,
+        host: '127.0.0.1',
+        token: apiToken,
+      };
+    } else {
+      api = { enabled: false, port: 8080, host: '127.0.0.1', token: '' };
+    }
 
-    await writePrivateJson(CONFIG_PATH, { destination, delivery });
+
+    await writePrivateJson(CONFIG_PATH, { destination, delivery, api });
     await writePrivateJson(EXCLUDED_PATH, { names, ids });
   } finally {
     prompts.close();

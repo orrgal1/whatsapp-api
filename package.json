@@ -12,7 +12,8 @@
     "setup": "node setup.mjs",
     "start": "node forwarder.mjs",
     "service:status": "node service.mjs status",
-    "service:uninstall": "node service.mjs uninstall"
+    "service:uninstall": "node service.mjs uninstall",
+    "test": "node tests/test_api.mjs"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc13",

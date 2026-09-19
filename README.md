@@ -18,7 +18,7 @@ A macOS-only background service that forwards incoming WhatsApp messages to emai
 Paste this into any coding harness:
 
 ```text
-Set up https://github.com/orrgal1/whatsapp-email-forwarder on this Mac: clone it into a suitable local directory, run npm install and npm run setup, guide me through email configuration and WhatsApp QR pairing, verify the launchd service is running, and never expose or commit config.json, excluded-conversations.json, .whatsapp-auth, or logs.
+Set up <repository-url> on this Mac: clone it into a suitable local directory, run npm install and npm run setup, guide me through forwarding email registration and WhatsApp QR pairing, verify the launchd service is running, and never expose or commit config.json, excluded-conversations.json, .whatsapp-auth, or logs.
 ```
 
 ## Install and set up
@@ -28,7 +28,7 @@ npm install
 npm run setup
 ```
 
-The interactive setup asks for the destination email address, delivery method, and the settings required by that method. If WhatsApp is not paired yet, it displays a QR code. On your phone, open WhatsApp, go to **Settings → Linked Devices → Link a Device**, and scan the code.
+The interactive setup registers the forwarding email address, asks for the delivery method, and configures the settings required by that method. If WhatsApp is not paired yet, it displays a QR code. On your phone, open WhatsApp, go to **Settings → Linked Devices → Link a Device**, and scan the code.
 
 Setup writes local `config.json` and `excluded-conversations.json` files, pairs WhatsApp, then installs and starts the per-user macOS launchd service. These local files and WhatsApp credentials are gitignored.
 
@@ -71,6 +71,95 @@ npm run service:uninstall
 ```
 
 Run `npm run setup` again to update configuration, repair pairing, or reinstall the service.
+
+## WhatsApp Chat Interactions API
+
+An authenticated HTTP API runs alongside the forwarder, allowing remote agents and services to inspect chats, send messages, reply to threads, and react with emojis.
+
+- **OpenAPI Schema (Inspection):** `GET /openapi.json` (unauthenticated for agent discovery)
+- **Interactive Swagger UI:** `GET /docs`
+- **Authentication:** `Authorization: Bearer <TOKEN>` on all protected endpoints
+
+### Endpoints
+
+- `GET /health` — Check WhatsApp connection state, linked phone number, and uptime.
+- `GET /contacts` — List all known contacts with display names and phone numbers.
+- `GET /contacts/search?q=...` — Search contacts and chats by name or phone, and verify WhatsApp registration.
+- `GET /chats` — List recent conversations with bound contact names, phone numbers, and unread counts.
+- `GET /chats/search?q=...` — Search recent chats by contact name, phone number, JID, or message contents.
+- `GET /chats/{chatId}/messages?limit=20` — Fetch recent message history in a chat for context.
+- `POST /messages/send` — Send a new text or media message to a phone number or JID.
+- `POST /messages/reply` — Reply directly to a message by quoting its message ID.
+- `POST /messages/react` — Add an emoji reaction to a message (or empty string to remove).
+- `POST /chats/{chatId}/presence` — Send `composing`, `recording`, or `paused` indicator.
+- `POST /chats/{chatId}/read` — Mark a chat or specific message as read.
+
+### Remote Agent Quick Reference
+
+#### 1. Inspect OpenAPI Specification
+```bash
+curl -s http://localhost:8080/openapi.json | jq .
+```
+
+#### 2. Check Health & Connection
+```bash
+curl -X GET http://localhost:8080/health \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 3. List Recent Chats
+```bash
+curl -X GET http://localhost:8080/chats \
+  -H "Authorization: Bearer $TOKEN"
+```
+#### 4. Search Contacts & Resolve Identity
+```bash
+curl -X GET "http://localhost:8080/contacts/search?q=Alice" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 5. Send a Message
+```bash
+curl -X POST http://localhost:8080/messages/send \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "+1234567890",
+    "text": "Hello from agent!"
+  }'
+```
+
+#### 6. Reply to a Specific Message
+```bash
+curl -X POST http://localhost:8080/messages/reply \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chatId": "1234567890@s.whatsapp.net",
+    "quotedMessageId": "3EB012345678",
+    "text": "Sounds good!"
+  }'
+```
+
+#### 7. React to a Message
+```bash
+curl -X POST http://localhost:8080/messages/react \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chatId": "1234567890@s.whatsapp.net",
+    "messageId": "3EB012345678",
+    "emoji": "👍"
+  }'
+```
+
+### Exposing Publicly via Tunnel
+
+To expose the API to remote agents securely, use a Cloudflare Tunnel:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8080
+```
 
 ## Message and media behavior
 
