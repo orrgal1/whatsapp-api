@@ -7,12 +7,145 @@ const MAX_CHATS = 500;
 
 export class ChatStore {
   constructor() {
-    this.chats = new Map(); // chatId -> { id, name, isGroup, unreadCount, updatedAt, lastMessage }
+    this.chats = new Map(); // chatId -> { id, name, isGroup, phone, unreadCount, updatedAt, lastMessage }
     this.messages = new Map(); // chatId -> Array of message objects
+    this.contacts = new Map(); // id -> { id, name, notify, verifiedName, phone }
+    this.lidMap = new Map(); // lid -> jid/phone or jid/phone -> lid
+  }
+
+  extractPhone(jid) {
+    if (!jid || typeof jid !== 'string') return '';
+    if (jid.endsWith('@s.whatsapp.net')) {
+      const num = jid.replace('@s.whatsapp.net', '').replace(/:.*/, '');
+      return num ? `+${num}` : '';
+    }
+    return '';
+  }
+
+  recordLidMapping(lid, jid) {
+    if (!lid || !jid) return;
+    this.lidMap.set(lid, jid);
+    this.lidMap.set(jid, lid);
+
+    const contact = this.contacts.get(jid);
+    if (contact) {
+      this.contacts.set(lid, { ...contact, id: lid, alternateId: jid });
+    }
+  }
+
+  recordContact({ id, name, notify, verifiedName, phone }) {
+    if (!id) return;
+    const existing = this.contacts.get(id) || { id };
+    const resolvedPhone = phone || existing.phone || this.extractPhone(id) || (this.lidMap.has(id) ? this.extractPhone(this.lidMap.get(id)) : '');
+    const updated = {
+      id,
+      name: name || existing.name || '',
+      notify: notify || existing.notify || '',
+      verifiedName: verifiedName || existing.verifiedName || '',
+      phone: resolvedPhone,
+    };
+    this.contacts.set(id, updated);
+
+    // If an alternate ID / LID exists, update it too
+    if (this.lidMap.has(id)) {
+      const altId = this.lidMap.get(id);
+      const altExisting = this.contacts.get(altId) || { id: altId };
+      this.contacts.set(altId, {
+        ...altExisting,
+        name: updated.name || altExisting.name || '',
+        notify: updated.notify || altExisting.notify || '',
+        verifiedName: updated.verifiedName || altExisting.verifiedName || '',
+        phone: resolvedPhone || altExisting.phone || '',
+      });
+    }
+
+    // Update corresponding chat name if it exists
+    const chat = this.chats.get(id) || (this.lidMap.has(id) ? this.chats.get(this.lidMap.get(id)) : null);
+    if (chat && !chat.isGroup) {
+      const bestName = updated.name || updated.notify || updated.verifiedName;
+      if (bestName) chat.name = bestName;
+      if (resolvedPhone && !chat.phone) chat.phone = resolvedPhone;
+    }
+  }
+
+  resolveDisplayName(jid, fallback = '') {
+    if (!jid) return fallback;
+    const contact = this.contacts.get(jid) || (this.lidMap.has(jid) ? this.contacts.get(this.lidMap.get(jid)) : null);
+    if (contact) {
+      const name = contact.name || contact.notify || contact.verifiedName;
+      if (name) return name;
+    }
+    return fallback || this.extractPhone(jid) || jid.replace(/@.*/, '');
+  }
+
+  getContacts() {
+    return Array.from(this.contacts.values()).map((c) => ({
+      id: c.id,
+      name: c.name || c.notify || c.verifiedName || c.phone || c.id,
+      notify: c.notify || '',
+      verifiedName: c.verifiedName || '',
+      phone: c.phone || '',
+    }));
+  }
+
+  searchContacts(query) {
+    if (!query || typeof query !== 'string') return [];
+    const q = query.trim().toLowerCase();
+    const digitsOnly = query.replace(/\D/g, '');
+
+    const results = [];
+    const seen = new Set();
+
+    for (const c of this.contacts.values()) {
+      if (seen.has(c.id)) continue;
+      const nameMatch = (c.name && c.name.toLowerCase().includes(q))
+        || (c.notify && c.notify.toLowerCase().includes(q))
+        || (c.verifiedName && c.verifiedName.toLowerCase().includes(q));
+      const idMatch = c.id.toLowerCase().includes(q);
+      const phoneMatch = digitsOnly.length >= 3 && c.phone && c.phone.replace(/\D/g, '').includes(digitsOnly);
+
+      if (nameMatch || idMatch || phoneMatch) {
+        seen.add(c.id);
+        results.push({
+          id: c.id,
+          name: c.name || c.notify || c.verifiedName || c.phone || c.id,
+          notify: c.notify || '',
+          verifiedName: c.verifiedName || '',
+          phone: c.phone || '',
+        });
+      }
+    }
+    return results;
+  }
+
+  searchChats(query) {
+    if (!query || typeof query !== 'string') return [];
+    const q = query.trim().toLowerCase();
+    const digitsOnly = query.replace(/\D/g, '');
+
+    const results = [];
+    for (const chat of this.chats.values()) {
+      const nameMatch = chat.name && chat.name.toLowerCase().includes(q);
+      const idMatch = chat.id.toLowerCase().includes(q);
+      const phoneMatch = digitsOnly.length >= 3 && chat.phone && chat.phone.replace(/\D/g, '').includes(digitsOnly);
+      const lastMsgMatch = chat.lastMessage?.text && chat.lastMessage.text.toLowerCase().includes(q);
+
+      if (nameMatch || idMatch || phoneMatch || lastMsgMatch) {
+        results.push(chat);
+      }
+    }
+    return results;
   }
 
   recordMessage({ id, chatId, senderId, senderName, fromMe, timestamp, type, text, rawMessage }) {
     if (!chatId) return;
+
+    if (senderName && senderId) {
+      this.recordContact({
+        id: senderId,
+        notify: senderName,
+      });
+    }
 
     if (!this.messages.has(chatId)) {
       this.messages.set(chatId, []);
@@ -42,19 +175,30 @@ export class ChatStore {
     }
 
     const isGroup = chatId.endsWith('@g.us');
+    const resolvedSenderName = senderName || this.resolveDisplayName(senderId, senderId.replace(/@.*/, ''));
+    const resolvedChatName = isGroup
+      ? (this.chats.get(chatId)?.name || chatId.replace(/@.*/, ''))
+      : this.resolveDisplayName(chatId, resolvedSenderName);
+    const resolvedPhone = this.extractPhone(chatId) || (this.lidMap.has(chatId) ? this.extractPhone(this.lidMap.get(chatId)) : '');
+
     const existingChat = this.chats.get(chatId) || {
       id: chatId,
-      name: isGroup ? chatId.replace(/@.*/, '') : (senderName || chatId.replace(/@.*/, '')),
+      name: resolvedChatName || chatId.replace(/@.*/, ''),
       isGroup,
+      phone: resolvedPhone,
       unreadCount: 0,
     };
 
     if (!fromMe) {
       existingChat.unreadCount = (existingChat.unreadCount || 0) + 1;
     }
-    if (senderName && !isGroup) {
-      existingChat.name = senderName;
+    if (resolvedChatName && !isGroup) {
+      existingChat.name = resolvedChatName;
     }
+    if (resolvedPhone && !existingChat.phone) {
+      existingChat.phone = resolvedPhone;
+    }
+
     existingChat.lastMessage = {
       id,
       text: text || `[${type}]`,
@@ -72,17 +216,20 @@ export class ChatStore {
     }
   }
 
-  setChatMetadata(chatId, { name, isGroup }) {
+  setChatMetadata(chatId, { name, isGroup, phone }) {
     if (!chatId) return;
+    const resolvedPhone = phone || this.extractPhone(chatId) || (this.lidMap.has(chatId) ? this.extractPhone(this.lidMap.get(chatId)) : '');
     const existing = this.chats.get(chatId) || {
       id: chatId,
-      name: name || chatId.replace(/@.*/, ''),
+      name: name || this.resolveDisplayName(chatId, chatId.replace(/@.*/, '')),
       isGroup: Boolean(isGroup),
+      phone: resolvedPhone,
       unreadCount: 0,
       updatedAt: Date.now(),
     };
     if (name) existing.name = name;
     if (typeof isGroup === 'boolean') existing.isGroup = isGroup;
+    if (resolvedPhone) existing.phone = resolvedPhone;
     this.chats.set(chatId, existing);
   }
 
@@ -132,7 +279,7 @@ export function generateOpenApiSpec(serverUrl = '') {
         bearerAuth: {
           type: 'http',
           scheme: 'bearer',
-          bearerFormat: 'JWT or Token',
+          bearerFormat: 'Token',
           description: 'Bearer token configured in config.json',
         },
       },
@@ -145,14 +292,27 @@ export function generateOpenApiSpec(serverUrl = '') {
             phone: { type: 'string', example: '1234567890' },
             uptimeSeconds: { type: 'number', example: 120 },
             chatsCount: { type: 'number', example: 12 },
+            contactsCount: { type: 'number', example: 45 },
           },
           required: ['status', 'connected', 'phone', 'uptimeSeconds'],
+        },
+        ContactItem: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', example: '1234567890@s.whatsapp.net' },
+            name: { type: 'string', example: 'Alice Smith' },
+            notify: { type: 'string', example: 'Alice' },
+            verifiedName: { type: 'string', example: 'Alice' },
+            phone: { type: 'string', example: '+1234567890' },
+          },
+          required: ['id', 'name'],
         },
         ChatSummary: {
           type: 'object',
           properties: {
             id: { type: 'string', example: '1234567890@s.whatsapp.net' },
-            name: { type: 'string', example: 'Alice' },
+            name: { type: 'string', example: 'Alice Smith' },
+            phone: { type: 'string', example: '+1234567890' },
             isGroup: { type: 'boolean', example: false },
             unreadCount: { type: 'number', example: 0 },
             updatedAt: { type: 'number', example: 1726750000000 },
@@ -288,10 +448,101 @@ export function generateOpenApiSpec(serverUrl = '') {
           },
         },
       },
+      '/contacts': {
+        get: {
+          summary: 'List Contacts',
+          description: 'Returns all known contacts with resolved names, notify names, and phone numbers.',
+          security: [{ bearerAuth: [] }],
+          responses: {
+            200: {
+              description: 'List of contacts',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      contacts: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ContactItem' },
+                      },
+                    },
+                    required: ['contacts'],
+                  },
+                },
+              },
+            },
+            401: {
+              description: 'Unauthorized',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ErrorResponse' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/contacts/search': {
+        get: {
+          summary: 'Search Contacts and Chats',
+          description: 'Resolves contacts or chats by name, phone number, or JID. Verifies existence on WhatsApp for phone numbers.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: 'q',
+              in: 'query',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Search term (name, phone number, or JID)',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Search results',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      query: { type: 'string' },
+                      contacts: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ContactItem' },
+                      },
+                      chats: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ChatSummary' },
+                      },
+                      verified: {
+                        type: 'object',
+                        nullable: true,
+                        properties: {
+                          phone: { type: 'string' },
+                          jid: { type: 'string' },
+                          exists: { type: 'boolean' },
+                        },
+                      },
+                    },
+                    required: ['query', 'contacts', 'chats'],
+                  },
+                },
+              },
+            },
+            401: {
+              description: 'Unauthorized',
+              content: {
+                'application/json': {
+                  schema: { $ref: '#/components/schemas/ErrorResponse' },
+                },
+              },
+            },
+          },
+        },
+      },
       '/chats': {
         get: {
           summary: 'List Recent Chats',
-          description: 'Returns a list of recent chats with unread counts and last message details.',
+          description: 'Returns a list of recent chats with bound contact names, unread counts, and last message details.',
           security: [{ bearerAuth: [] }],
           responses: {
             200: {
@@ -316,6 +567,42 @@ export function generateOpenApiSpec(serverUrl = '') {
               content: {
                 'application/json': {
                   schema: { $ref: '#/components/schemas/ErrorResponse' },
+                },
+              },
+            },
+          },
+        },
+      },
+      '/chats/search': {
+        get: {
+          summary: 'Search Chats',
+          description: 'Searches active chats by name, phone number, JID, or message contents.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: 'q',
+              in: 'query',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Query string',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Matching chats',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      query: { type: 'string' },
+                      chats: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ChatSummary' },
+                      },
+                    },
+                    required: ['query', 'chats'],
+                  },
                 },
               },
             },
@@ -771,6 +1058,53 @@ export function createApiServer({
           phone,
           uptimeSeconds,
           chatsCount: store.getChats().length,
+          contactsCount: store.getContacts().length,
+        });
+        return;
+      }
+
+      // Contacts list
+      if (pathname === '/contacts' && req.method === 'GET') {
+        sendJson(res, 200, { contacts: store.getContacts() });
+        return;
+      }
+
+      // Contacts / identity search: GET /contacts/search?q=...
+      if (pathname === '/contacts/search' && req.method === 'GET') {
+        const query = (url.searchParams.get('q') || '').trim();
+        const matchedContacts = store.searchContacts(query);
+        const matchedChats = store.searchChats(query);
+        let verified = null;
+
+        const digitsOnly = query.replace(/\D/g, '');
+        if (digitsOnly.length >= 7) {
+          const sock = getSocket ? getSocket() : null;
+          if (sock?.onWhatsApp) {
+            try {
+              const onWa = await sock.onWhatsApp(digitsOnly);
+              if (Array.isArray(onWa) && onWa.length > 0 && onWa[0].exists) {
+                const verifiedJid = onWa[0].jid;
+                verified = {
+                  phone: `+${digitsOnly}`,
+                  jid: verifiedJid,
+                  exists: true,
+                };
+                store.recordContact({
+                  id: verifiedJid,
+                  phone: `+${digitsOnly}`,
+                });
+              }
+            } catch (err) {
+              logger.error?.('[onWhatsApp search error]', err.message);
+            }
+          }
+        }
+
+        sendJson(res, 200, {
+          query,
+          contacts: matchedContacts,
+          chats: matchedChats,
+          verified,
         });
         return;
       }
@@ -778,6 +1112,14 @@ export function createApiServer({
       // Chats list
       if (pathname === '/chats' && req.method === 'GET') {
         sendJson(res, 200, { chats: store.getChats() });
+        return;
+      }
+
+      // Chats search: GET /chats/search?q=...
+      if (pathname === '/chats/search' && req.method === 'GET') {
+        const query = (url.searchParams.get('q') || '').trim();
+        const matchedChats = store.searchChats(query);
+        sendJson(res, 200, { query, chats: matchedChats });
         return;
       }
 

@@ -5,7 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
@@ -45,6 +45,40 @@ let pairingComplete = false;
 const chatStore = new ChatStore();
 let currentSock = null;
 let apiServer = null;
+function loadAuthLidMappings() {
+  try {
+    const files = readdirSync(AUTH_DIR);
+    let count = 0;
+    for (const file of files) {
+      if (file.startsWith('lid-mapping-') && file.endsWith('_reverse.json')) {
+        const lidNum = file.replace('lid-mapping-', '').replace('_reverse.json', '');
+        const lid = `${lidNum}@lid`;
+        try {
+          const raw = readFileSync(new URL(file, `file://${AUTH_DIR}/`), 'utf8');
+          const phone = JSON.parse(raw);
+          if (phone) {
+            const cleanPhone = String(phone).replace(/\D/g, '');
+            const jid = `${cleanPhone}@s.whatsapp.net`;
+            chatStore.recordLidMapping(lid, jid);
+            chatStore.recordContact({
+              id: lid,
+              phone: `+${cleanPhone}`,
+            });
+            chatStore.recordContact({
+              id: jid,
+              phone: `+${cleanPhone}`,
+            });
+            count++;
+          }
+        } catch {}
+      }
+    }
+    if (count > 0) {
+      console.log(`Loaded ${count} LID identity mappings from credentials.`);
+    }
+  } catch {}
+}
+loadAuthLidMappings();
 
 function readJson(filename) {
   try {
@@ -263,6 +297,95 @@ async function connect() {
   });
 
   if (PAIR_ONLY) return;
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) {
+      if (!c?.id) continue;
+      chatStore.recordContact({
+        id: c.id,
+        name: c.name || '',
+        notify: c.notify || '',
+        verifiedName: c.verifiedName || '',
+      });
+    }
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    for (const c of updates) {
+      if (!c?.id) continue;
+      chatStore.recordContact({
+        id: c.id,
+        name: c.name || '',
+        notify: c.notify || '',
+        verifiedName: c.verifiedName || '',
+      });
+    }
+  });
+
+  sock.ev.on('chats.upsert', (chats) => {
+    for (const chat of chats) {
+      if (!chat?.id) continue;
+      const isGroup = chat.id.endsWith('@g.us');
+      chatStore.setChatMetadata(chat.id, {
+        name: chat.name || '',
+        isGroup,
+      });
+    }
+  });
+
+  sock.ev.on('chats.update', (updates) => {
+    for (const chat of updates) {
+      if (!chat?.id) continue;
+      chatStore.setChatMetadata(chat.id, {
+        name: chat.name || '',
+      });
+    }
+  });
+
+  sock.ev.on('messaging-history.set', ({ chats, contacts, messages }) => {
+    if (Array.isArray(contacts)) {
+      for (const c of contacts) {
+        if (!c?.id) continue;
+        chatStore.recordContact({
+          id: c.id,
+          name: c.name || '',
+          notify: c.notify || '',
+          verifiedName: c.verifiedName || '',
+        });
+      }
+    }
+    if (Array.isArray(chats)) {
+      for (const chat of chats) {
+        if (!chat?.id) continue;
+        const isGroup = chat.id.endsWith('@g.us');
+        chatStore.setChatMetadata(chat.id, {
+          name: chat.name || '',
+          isGroup,
+        });
+      }
+    }
+    if (Array.isArray(messages)) {
+      for (const msg of messages) {
+        if (!msg?.key?.id) continue;
+        const chatId = msg.key.remoteJid || '';
+        if (!chatId || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
+        const senderId = msg.key.participant || chatId;
+        const sender = msg.pushName || senderId.replace(/@.*/, '');
+        const details = describe(msg.message);
+        const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
+        chatStore.recordMessage({
+          id: msg.key.id,
+          chatId,
+          senderId,
+          senderName: msg.key.fromMe ? 'Me' : sender,
+          fromMe: Boolean(msg.key.fromMe),
+          timestamp: timestamp.getTime(),
+          type: details.type,
+          text: details.text,
+          rawMessage: msg.message,
+        });
+      }
+    }
+  });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;

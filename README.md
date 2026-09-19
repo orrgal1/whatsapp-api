@@ -83,7 +83,10 @@ An authenticated HTTP API runs alongside the forwarder, allowing remote agents a
 ### Endpoints
 
 - `GET /health` — Check WhatsApp connection state, linked phone number, and uptime.
-- `GET /chats` — List recent conversations with unread counts and latest messages.
+- `GET /contacts` — List all known contacts with display names and phone numbers.
+- `GET /contacts/search?q=...` — Search contacts and chats by name or phone, and verify WhatsApp registration.
+- `GET /chats` — List recent conversations with bound contact names, phone numbers, and unread counts.
+- `GET /chats/search?q=...` — Search recent chats by contact name, phone number, JID, or message contents.
 - `GET /chats/{chatId}/messages?limit=20` — Fetch recent message history in a chat for context.
 - `POST /messages/send` — Send a new text or media message to a phone number or JID.
 - `POST /messages/reply` — Reply directly to a message by quoting its message ID.
@@ -109,8 +112,13 @@ curl -X GET http://localhost:8080/health \
 curl -X GET http://localhost:8080/chats \
   -H "Authorization: Bearer $TOKEN"
 ```
+#### 4. Search Contacts & Resolve Identity
+```bash
+curl -X GET "http://localhost:8080/contacts/search?q=Alice" \
+  -H "Authorization: Bearer $TOKEN"
+```
 
-#### 4. Send a Message
+#### 5. Send a Message
 ```bash
 curl -X POST http://localhost:8080/messages/send \
   -H "Authorization: Bearer $TOKEN" \
@@ -121,7 +129,7 @@ curl -X POST http://localhost:8080/messages/send \
   }'
 ```
 
-#### 5. Reply to a Specific Message
+#### 6. Reply to a Specific Message
 ```bash
 curl -X POST http://localhost:8080/messages/reply \
   -H "Authorization: Bearer $TOKEN" \
@@ -133,7 +141,7 @@ curl -X POST http://localhost:8080/messages/reply \
   }'
 ```
 
-#### 6. React to a Message
+#### 7. React to a Message
 ```bash
 curl -X POST http://localhost:8080/messages/react \
   -H "Authorization: Bearer $TOKEN" \
