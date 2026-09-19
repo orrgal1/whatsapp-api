@@ -4,3 +4,4 @@ config.json
 excluded-conversations.json
 .DS_Store
 *.log
+contacts-cache.json

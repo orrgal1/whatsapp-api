@@ -4,8 +4,10 @@ import makeWASocket, {
   getContentType,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
-import { execFile } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import nodemailer from 'nodemailer';
@@ -79,6 +81,108 @@ function loadAuthLidMappings() {
   } catch {}
 }
 loadAuthLidMappings();
+function normalizePhone(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return null;
+  if (raw.trim().startsWith('+')) {
+    return `+${digits}`;
+  }
+  if (digits.startsWith('0') && (digits.length === 9 || digits.length === 10)) {
+    return `+972${digits.slice(1)}`;
+  }
+  if (digits.startsWith('972')) {
+    return `+${digits}`;
+  }
+  return `+${digits}`;
+}
+
+function readAddressBookFromSqlite() {
+  if (process.platform !== 'darwin') return [];
+  const baseDir = path.join(os.homedir(), 'Library', 'Application Support', 'AddressBook');
+  const dbs = [];
+  const rootDb = path.join(baseDir, 'AddressBook-v22.abcddb');
+  if (existsSync(rootDb)) dbs.push(rootDb);
+
+  const sourcesDir = path.join(baseDir, 'Sources');
+  if (existsSync(sourcesDir)) {
+    try {
+      for (const s of readdirSync(sourcesDir)) {
+        const db = path.join(sourcesDir, s, 'AddressBook-v22.abcddb');
+        if (existsSync(db)) dbs.push(db);
+      }
+    } catch {}
+  }
+
+  const query = `
+    SELECT 
+      COALESCE(r.ZFIRSTNAME, ''), 
+      COALESCE(r.ZLASTNAME, ''), 
+      COALESCE(r.ZNICKNAME, ''), 
+      COALESCE(r.ZORGANIZATION, ''), 
+      p.ZFULLNUMBER 
+    FROM ZABCDRECORD r 
+    JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK 
+    WHERE p.ZFULLNUMBER IS NOT NULL;
+  `;
+
+  const contactsMap = new Map();
+  for (const db of dbs) {
+    try {
+      const output = execFileSync('/usr/bin/sqlite3', [db, '-separator', '\t', query], {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      for (const line of output.split('\n')) {
+        if (!line.trim()) continue;
+        const [first, last, nick, org, rawPhone] = line.split('\t');
+        const name = [first, last].filter(Boolean).join(' ') || nick || org;
+        if (!name || !rawPhone) continue;
+        const phone = normalizePhone(rawPhone);
+        if (!phone) continue;
+        contactsMap.set(phone, { name, phone });
+      }
+    } catch {}
+  }
+  return Array.from(contactsMap.values());
+}
+
+function loadMacAddressBookContacts() {
+  const cachePath = fileURLToPath(new URL('./contacts-cache.json', import.meta.url));
+  let contactsList = [];
+
+  if (existsSync(cachePath)) {
+    try {
+      contactsList = JSON.parse(readFileSync(cachePath, 'utf8'));
+    } catch {}
+  }
+
+  if (!Array.isArray(contactsList) || contactsList.length === 0) {
+    contactsList = readAddressBookFromSqlite();
+    if (contactsList.length > 0) {
+      try {
+        writeFileSync(cachePath, JSON.stringify(contactsList, null, 2), 'utf8');
+      } catch {}
+    }
+  }
+
+  let count = 0;
+  for (const item of contactsList) {
+    if (!item?.name || !item?.phone) continue;
+    const cleanDigits = item.phone.replace(/\D/g, '');
+    const jid = `${cleanDigits}@s.whatsapp.net`;
+    chatStore.recordContact({
+      id: jid,
+      name: item.name,
+      phone: item.phone,
+    });
+    count++;
+  }
+  if (count > 0) {
+    console.log(`Loaded ${count} contacts from AddressBook.`);
+  }
+}
+loadMacAddressBookContacts();
 
 function readJson(filename) {
   try {
@@ -243,7 +347,7 @@ async function connect() {
     auth: state,
     logger,
     markOnlineOnConnect: false,
-    syncFullHistory: false,
+    syncFullHistory: true,
     browser: ['WhatsApp Forwarder', 'Chrome', '120.0'],
     getMessage: async () => ({ conversation: '' }),
   });
@@ -283,6 +387,8 @@ async function connect() {
       } else {
         console.log(`Connected. Forwarding incoming WhatsApp messages to ${CONFIG.destination}.`);
       }
+        sock.resyncAppState?.(['critical_unblock_low', 'regular_high', 'regular_low', 'critical_block', 'regular'], false)
+          ?.catch?.(() => {});
     }
     if (connection === 'close' && !pairingComplete) {
       const status = lastDisconnect?.error?.output?.statusCode;

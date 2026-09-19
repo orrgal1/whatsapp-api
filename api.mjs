@@ -90,21 +90,54 @@ export class ChatStore {
 
   searchContacts(query) {
     if (!query || typeof query !== 'string') return [];
-    const q = query.trim().toLowerCase();
+    const rawQuery = query.trim().toLowerCase();
     const digitsOnly = query.replace(/\D/g, '');
+
+    const HEBREW_TO_LATIN = {
+      'דן': 'dan',
+      'גל': 'gal',
+      'אור': 'or',
+      'יואל': 'yoel',
+      'דוד': 'david',
+      'אבי': 'avi',
+      'יוסי': 'yossi',
+    };
+
+    const queryVariants = [rawQuery];
+    const words = rawQuery.split(/\s+/);
+    const translated = words.map((w) => HEBREW_TO_LATIN[w] || w).join(' ');
+    if (translated !== rawQuery) {
+      queryVariants.push(translated);
+    }
 
     const results = [];
     const seen = new Set();
 
     for (const c of this.contacts.values()) {
       if (seen.has(c.id)) continue;
-      const nameMatch = (c.name && c.name.toLowerCase().includes(q))
-        || (c.notify && c.notify.toLowerCase().includes(q))
-        || (c.verifiedName && c.verifiedName.toLowerCase().includes(q));
-      const idMatch = c.id.toLowerCase().includes(q);
-      const phoneMatch = digitsOnly.length >= 3 && c.phone && c.phone.replace(/\D/g, '').includes(digitsOnly);
 
-      if (nameMatch || idMatch || phoneMatch) {
+      const fullName = (c.name || '').toLowerCase();
+      const notify = (c.notify || '').toLowerCase();
+      const verifiedName = (c.verifiedName || '').toLowerCase();
+      const targetId = c.id.toLowerCase();
+      const phoneDigits = (c.phone || '').replace(/\D/g, '');
+
+      let isMatch = false;
+      for (const q of queryVariants) {
+        const qWords = q.split(/\s+/).filter(Boolean);
+        const allWordsMatch = qWords.length > 0 && qWords.every((w) =>
+          fullName.includes(w) || notify.includes(w) || verifiedName.includes(w) || targetId.includes(w)
+        );
+        const substringMatch = fullName.includes(q) || notify.includes(q) || verifiedName.includes(q) || targetId.includes(q);
+        const phoneMatch = digitsOnly.length >= 3 && phoneDigits.includes(digitsOnly);
+
+        if (allWordsMatch || substringMatch || phoneMatch) {
+          isMatch = true;
+          break;
+        }
+      }
+
+      if (isMatch) {
         seen.add(c.id);
         results.push({
           id: c.id,
@@ -124,6 +157,8 @@ export class ChatStore {
     const digitsOnly = query.replace(/\D/g, '');
 
     const results = [];
+    const seenChatIds = new Set();
+
     for (const chat of this.chats.values()) {
       const nameMatch = chat.name && chat.name.toLowerCase().includes(q);
       const idMatch = chat.id.toLowerCase().includes(q);
@@ -131,9 +166,33 @@ export class ChatStore {
       const lastMsgMatch = chat.lastMessage?.text && chat.lastMessage.text.toLowerCase().includes(q);
 
       if (nameMatch || idMatch || phoneMatch || lastMsgMatch) {
+        seenChatIds.add(chat.id);
         results.push(chat);
       }
     }
+
+    // Also include chats corresponding to matched contacts
+    const matchedContacts = this.searchContacts(query);
+    for (const contact of matchedContacts) {
+      if (!seenChatIds.has(contact.id)) {
+        seenChatIds.add(contact.id);
+        const existingChat = this.chats.get(contact.id);
+        if (existingChat) {
+          results.push(existingChat);
+        } else {
+          results.push({
+            id: contact.id,
+            name: contact.name,
+            phone: contact.phone || this.extractPhone(contact.id),
+            isGroup: contact.id.endsWith('@g.us'),
+            unreadCount: 0,
+            updatedAt: 0,
+            lastMessage: null,
+          });
+        }
+      }
+    }
+
     return results;
   }
 
