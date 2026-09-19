@@ -12,6 +12,7 @@ import nodemailer from 'nodemailer';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
+import { createApiServer, ChatStore } from './api.mjs';
 const originalConsoleWarn = console.warn.bind(console);
 const originalConsoleInfo = console.info.bind(console);
 const suppressedSignalWarnings = new Set([
@@ -41,6 +42,9 @@ const versionPromise = fetchLatestBaileysVersion()
 const seen = new Set();
 let mailQueue = Promise.resolve();
 let pairingComplete = false;
+const chatStore = new ChatStore();
+let currentSock = null;
+let apiServer = null;
 
 function readJson(filename) {
   try {
@@ -64,31 +68,40 @@ function loadConfig() {
   const delivery = value.delivery;
   if (!delivery || typeof delivery !== 'object') throw new Error('config.delivery must be an object.');
 
+  let deliveryConfig;
   if (delivery.type === 'gapi') {
-    return {
-      destination,
-      delivery: { type: 'gapi', command: requireString(delivery.command, 'config.delivery.command') },
-    };
-  }
-  if (delivery.type === 'smtp') {
+    deliveryConfig = { type: 'gapi', command: requireString(delivery.command, 'config.delivery.command') };
+  } else if (delivery.type === 'smtp') {
     const port = Number(delivery.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       throw new Error('config.delivery.port must be an integer from 1 to 65535.');
     }
     if (typeof delivery.secure !== 'boolean') throw new Error('config.delivery.secure must be a boolean.');
-    return {
-      destination,
-      delivery: {
-        type: 'smtp',
-        host: requireString(delivery.host, 'config.delivery.host'),
-        port,
-        secure: delivery.secure,
-        user: requireString(delivery.user, 'config.delivery.user'),
-        password: requireString(delivery.password, 'config.delivery.password'),
-      },
+    deliveryConfig = {
+      type: 'smtp',
+      host: requireString(delivery.host, 'config.delivery.host'),
+      port,
+      secure: delivery.secure,
+      user: requireString(delivery.user, 'config.delivery.user'),
+      password: requireString(delivery.password, 'config.delivery.password'),
     };
+  } else {
+    throw new Error('config.delivery.type must be "gapi" or "smtp".');
   }
-  throw new Error('config.delivery.type must be "gapi" or "smtp".');
+
+  const api = value.api && typeof value.api === 'object' ? {
+    enabled: value.api.enabled !== false,
+    port: Number(value.api.port) || 8080,
+    host: value.api.host || '127.0.0.1',
+    token: typeof value.api.token === 'string' ? value.api.token.trim() : '',
+  } : {
+    enabled: true,
+    port: 8080,
+    host: '127.0.0.1',
+    token: '',
+  };
+
+  return { destination, delivery: deliveryConfig, api };
 }
 
 function loadExcludedConversations() {
@@ -200,6 +213,22 @@ async function connect() {
     browser: ['WhatsApp Forwarder', 'Chrome', '120.0'],
     getMessage: async () => ({ conversation: '' }),
   });
+  currentSock = sock;
+
+  if (!PAIR_ONLY && CONFIG.api?.enabled !== false && !apiServer) {
+    apiServer = createApiServer({
+      getSocket: () => currentSock,
+      token: CONFIG.api.token,
+      store: chatStore,
+      logger: console,
+    });
+    try {
+      await apiServer.listen(CONFIG.api.port, CONFIG.api.host);
+      console.log(`API server listening on http://${CONFIG.api.host}:${CONFIG.api.port} (OpenAPI: /openapi.json, Docs: /docs)`);
+    } catch (err) {
+      console.error(`Failed to start API server on port ${CONFIG.api.port}:`, err.message);
+    }
+  }
   sock.ev.on('creds.update', saveCreds);
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
@@ -241,9 +270,7 @@ async function connect() {
     for (const msg of messages) {
       const id = msg.key.id;
       const chatId = msg.key.remoteJid || '';
-      if (!id || seen.has(id) || msg.key.fromMe || !msg.message || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
-      seen.add(id);
-      if (seen.size > 5000) seen.delete(seen.values().next().value);
+      if (!id || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) continue;
 
       const senderId = msg.key.participant || chatId;
       const sender = msg.pushName || senderId.replace(/@.*/, '');
@@ -252,12 +279,31 @@ async function connect() {
       if (isGroup) {
         try { chat = (await sock.groupMetadata(chatId)).subject || chat; } catch {}
       }
+
+      const details = describe(msg.message);
+      const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
+
+      chatStore.recordMessage({
+        id,
+        chatId,
+        senderId,
+        senderName: msg.key.fromMe ? 'Me' : sender,
+        fromMe: Boolean(msg.key.fromMe),
+        timestamp: timestamp.getTime(),
+        type: details.type,
+        text: details.text,
+        rawMessage: msg.message,
+      });
+      chatStore.setChatMetadata(chatId, { name: chat, isGroup });
+
+      if (seen.has(id) || msg.key.fromMe || !msg.message) continue;
+      seen.add(id);
+      if (seen.size > 5000) seen.delete(seen.values().next().value);
+
       if (isExcludedConversation({ chatId, senderId, sender, chat })) {
         console.log(`Skipped excluded conversation ${chat}.`);
         continue;
       }
-      const details = describe(msg.message);
-      const timestamp = new Date(Number(msg.messageTimestamp || Date.now() / 1000) * 1000);
       const subject = `WhatsApp from ${sender}${isGroup ? ` in ${chat}` : ''}`;
       const body = [
         `From: ${sender} (${senderId})`,
