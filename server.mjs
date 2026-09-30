@@ -4,13 +4,11 @@ import makeWASocket, {
   getContentType,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
-import nodemailer from 'nodemailer';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 
@@ -33,18 +31,14 @@ console.info = (...args) => {
   if (!suppressedSignalInfo.has(args[0])) originalConsoleInfo(...args);
 };
 
-const ROOT = fileURLToPath(new URL('./', import.meta.url));
 const AUTH_DIR = fileURLToPath(new URL('./.whatsapp-auth/', import.meta.url));
 const PAIR_ONLY = process.argv.slice(2).includes('--pair-only');
-const run = promisify(execFile);
 const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
 const versionPromise = fetchLatestBaileysVersion()
   .then(({ version }) => version)
   .catch(() => null);
-const seen = new Set();
-let mailQueue = Promise.resolve();
 let pairingComplete = false;
-const chatStore = new ChatStore();
+const chatStore = new ChatStore({ databasePath: fileURLToPath(new URL('./chat-cache.sqlite3', import.meta.url)) });
 let currentSock = null;
 let apiServer = null;
 function loadAuthLidMappings() {
@@ -195,83 +189,22 @@ function readJson(filename) {
   }
 }
 
-function requireString(value, field) {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be a non-empty string.`);
-  return value.trim();
-}
-
 function loadConfig() {
   const value = readJson('./config.json');
-  const destination = requireString(value.destination, 'config.destination');
-  const delivery = value.delivery;
-  if (!delivery || typeof delivery !== 'object') throw new Error('config.delivery must be an object.');
-
-  let deliveryConfig;
-  if (delivery.type === 'gapi') {
-    deliveryConfig = { type: 'gapi', command: requireString(delivery.command, 'config.delivery.command') };
-  } else if (delivery.type === 'smtp') {
-    const port = Number(delivery.port);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error('config.delivery.port must be an integer from 1 to 65535.');
-    }
-    if (typeof delivery.secure !== 'boolean') throw new Error('config.delivery.secure must be a boolean.');
-    deliveryConfig = {
-      type: 'smtp',
-      host: requireString(delivery.host, 'config.delivery.host'),
-      port,
-      secure: delivery.secure,
-      user: requireString(delivery.user, 'config.delivery.user'),
-      password: requireString(delivery.password, 'config.delivery.password'),
-    };
-  } else {
-    throw new Error('config.delivery.type must be "gapi" or "smtp".');
-  }
-
   const api = value.api && typeof value.api === 'object' ? {
     enabled: value.api.enabled !== false,
     port: Number(value.api.port) || 8080,
     host: value.api.host || '127.0.0.1',
-    token: typeof value.api.token === 'string' ? value.api.token.trim() : '',
   } : {
     enabled: true,
     port: 8080,
     host: '127.0.0.1',
-    token: '',
   };
 
-  return { destination, delivery: deliveryConfig, api };
-}
-
-function loadExcludedConversations() {
-  const value = readJson('./excluded-conversations.json');
-  if (!Array.isArray(value.names) || !Array.isArray(value.ids)) {
-    throw new Error('excluded-conversations.json must contain names and ids arrays.');
-  }
-  const normalize = (item) => String(item).trim().toLowerCase();
-  return {
-    names: new Set(value.names.map(normalize).filter(Boolean)),
-    ids: new Set(value.ids.map(normalize).filter(Boolean)),
-  };
+  return { api };
 }
 
 const CONFIG = loadConfig();
-const EXCLUDED = loadExcludedConversations();
-const smtpTransport = CONFIG.delivery.type === 'smtp'
-  ? nodemailer.createTransport({
-      host: CONFIG.delivery.host,
-      port: CONFIG.delivery.port,
-      secure: CONFIG.delivery.secure,
-      auth: { user: CONFIG.delivery.user, pass: CONFIG.delivery.password },
-    })
-  : null;
-
-function isExcludedConversation({ chatId, senderId, sender, chat }) {
-  const ids = [chatId, senderId, chatId.replace(/@.*/, ''), senderId.replace(/@.*/, '')]
-    .map((value) => value.toLowerCase());
-  const names = [sender, chat].map((value) => value.trim().toLowerCase());
-  return ids.some((value) => EXCLUDED.ids.has(value))
-    || names.some((value) => EXCLUDED.names.has(value));
-}
 
 function unwrap(message) {
   let current = message;
@@ -311,34 +244,6 @@ function describe(message) {
   }
 }
 
-async function sendMail(subject, body) {
-  if (CONFIG.delivery.type === 'gapi') {
-    await run(CONFIG.delivery.command, [
-      'gmail',
-      'send',
-      '--to',
-      CONFIG.destination,
-      '--subject',
-      subject,
-      '--body',
-      body,
-    ], { cwd: ROOT, timeout: 120_000, maxBuffer: 1024 * 1024 });
-    return;
-  }
-
-  await smtpTransport.sendMail({
-    from: CONFIG.delivery.user,
-    to: CONFIG.destination,
-    subject,
-    text: body,
-  });
-}
-
-function enqueueMail(work) {
-  mailQueue = mailQueue.then(work, work);
-  return mailQueue;
-}
-
 async function connect() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const version = await versionPromise;
@@ -354,9 +259,13 @@ async function connect() {
   currentSock = sock;
 
   if (!PAIR_ONLY && CONFIG.api?.enabled !== false && !apiServer) {
+    const token = process.env.SHARED_BEARER_TOKEN?.trim();
+    if (!token) {
+      throw new Error('The WhatsApp API requires SHARED_BEARER_TOKEN in the environment');
+    }
     apiServer = createApiServer({
       getSocket: () => currentSock,
-      token: CONFIG.api.token,
+      token,
       store: chatStore,
       logger: console,
     });
@@ -365,6 +274,7 @@ async function connect() {
       console.log(`API server listening on http://${CONFIG.api.host}:${CONFIG.api.port} (OpenAPI: /openapi.json, Docs: /docs)`);
     } catch (err) {
       console.error(`Failed to start API server on port ${CONFIG.api.port}:`, err.message);
+      throw err;
     }
   }
   sock.ev.on('creds.update', saveCreds);
@@ -385,7 +295,7 @@ async function connect() {
           process.exit(1);
         }
       } else {
-        console.log(`Connected. Forwarding incoming WhatsApp messages to ${CONFIG.destination}.`);
+        console.log('WhatsApp connected; API is ready.');
       }
         sock.resyncAppState?.(['critical_unblock_low', 'regular_high', 'regular_low', 'critical_block', 'regular'], false)
           ?.catch?.(() => {});
@@ -525,32 +435,6 @@ async function connect() {
       });
       chatStore.setChatMetadata(chatId, { name: chat, isGroup });
 
-      if (seen.has(id) || msg.key.fromMe || !msg.message) continue;
-      seen.add(id);
-      if (seen.size > 5000) seen.delete(seen.values().next().value);
-
-      if (isExcludedConversation({ chatId, senderId, sender, chat })) {
-        console.log(`Skipped excluded conversation ${chat}.`);
-        continue;
-      }
-      const subject = `WhatsApp from ${sender}${isGroup ? ` in ${chat}` : ''}`;
-      const body = [
-        `From: ${sender} (${senderId})`,
-        `Chat: ${chat}${isGroup ? ' (group)' : ''}`,
-        `Received: ${timestamp.toLocaleString()}`,
-        `Type: ${details.type}`,
-        '',
-        details.text,
-      ].join('\n');
-
-      enqueueMail(async () => {
-        try {
-          await sendMail(subject, body);
-          console.log(`Forwarded ${details.type} from ${sender} through ${CONFIG.delivery.type}.`);
-        } catch (error) {
-          console.error(`Failed to forward message ${id}:`, error.message);
-        }
-      });
     }
   });
 }

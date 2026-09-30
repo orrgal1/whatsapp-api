@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const SERVICE_LABEL = 'com.local.whatsapp-email-forwarder';
+export const SERVICE_LABEL = 'com.local.whatsapp-api';
+const LEGACY_SERVICE_LABEL = 'com.local.whatsapp-email-forwarder';
 
 const APP_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const LAUNCH_AGENTS_DIR = path.join(os.homedir(), 'Library', 'LaunchAgents');
@@ -12,8 +13,9 @@ export const SERVICE_PLIST_PATH = path.join(
   LAUNCH_AGENTS_DIR,
   `${SERVICE_LABEL}.plist`,
 );
-const LOG_PATH = path.join(APP_ROOT, 'forwarder.log');
-const FORWARDER_PATH = path.join(APP_ROOT, 'forwarder.mjs');
+const LOG_PATH = path.join(APP_ROOT, 'service.log');
+const SERVER_PATH = path.join(APP_ROOT, 'server.mjs');
+const GATEWAY_RUNNER_PATH = path.resolve(APP_ROOT, '../local-api-gateway/run_service.py');
 const DOMAIN = `gui/${process.getuid()}`;
 const LAUNCHCTL = '/bin/launchctl';
 
@@ -125,8 +127,11 @@ function createPlist() {
 ${string(SERVICE_LABEL)}
   <key>ProgramArguments</key>
   <array>
+${string('/usr/bin/python3')}
+${string(GATEWAY_RUNNER_PATH)}
+${string('whatsapp-api')}
 ${string(process.execPath)}
-${string(FORWARDER_PATH)}
+${string(SERVER_PATH)}
   </array>
   <key>WorkingDirectory</key>
 ${string(APP_ROOT)}
@@ -167,6 +172,9 @@ async function writePlistAtomically(contents) {
 
 export async function installService() {
   await fs.mkdir(LAUNCH_AGENTS_DIR, { recursive: true });
+  const legacyPlist = path.join(LAUNCH_AGENTS_DIR, `${LEGACY_SERVICE_LABEL}.plist`);
+  await unloadService(LEGACY_SERVICE_LABEL, legacyPlist);
+  await removePlist(legacyPlist);
   await unloadService(SERVICE_LABEL, SERVICE_PLIST_PATH);
   await removePlist(SERVICE_PLIST_PATH);
   await writePlistAtomically(createPlist());

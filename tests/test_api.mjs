@@ -1,5 +1,10 @@
 import { createApiServer, ChatStore, normalizeJid } from '../api.mjs';
 import assert from 'node:assert';
+import { Readable } from 'node:stream';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 async function runTests() {
   console.log('Starting WhatsApp Chat API test suite...');
@@ -43,6 +48,40 @@ async function runTests() {
   assert.strictEqual(chats[0].unreadCount, 1);
   console.log('✓ ChatStore & LID contact resolution passed');
 
+  const cacheDir = mkdtempSync(path.join(os.tmpdir(), 'whatsapp-api-cache-'));
+  try {
+    const databasePath = path.join(cacheDir, 'messages.sqlite3');
+    const persisted = new ChatStore({ databasePath });
+    persisted.recordMessage({ id: 'durable-1', chatId: 'chat@lid', senderId: 'sender@lid',
+      senderName: 'Sender', timestamp: 1234, type: 'text', text: 'Stored message',
+      rawMessage: { conversation: 'Sensitive raw protocol data' } });
+    assert.strictEqual(statSync(databasePath).mode & 0o777, 0o600);
+    persisted.close();
+    const reopened = new ChatStore({ databasePath });
+    assert.strictEqual(reopened.getMessages('chat@lid')[0].text, 'Stored message');
+    assert.strictEqual(reopened.getMessages('chat@lid')[0].rawMessage, null);
+    assert.strictEqual(reopened.listMessages({ q: 'stored' })[0].id, 'durable-1');
+    reopened.close();
+    const db = new DatabaseSync(databasePath);
+    assert.strictEqual(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 1);
+    assert.strictEqual(db.prepare('SELECT * FROM messages').get().text, 'Stored message');
+    db.close();
+    const bounded = new ChatStore({ databasePath });
+    for (let index = 0; index < 105; index += 1) {
+      bounded.recordMessage({ id: `bounded-${index}`, chatId: 'chat@lid',
+        senderId: 'sender@lid', timestamp: 2000 + index, text: `message ${index}` });
+    }
+    bounded.close();
+    const boundedReopened = new ChatStore({ databasePath });
+    assert.strictEqual(boundedReopened.getMessages('chat@lid', 500).length, 100);
+    assert.strictEqual(boundedReopened.getMessage('chat@lid', 'bounded-0'), undefined);
+    assert.strictEqual(boundedReopened.getMessage('chat@lid', 'bounded-104')?.text, 'message 104');
+    boundedReopened.close();
+  } finally {
+    rmSync(cacheDir, { recursive: true, force: true });
+  }
+  console.log('✓ message cache survives restart without raw protocol data');
+
   // 3. Mock Baileys socket
   const sentMessages = [];
   const presenceUpdates = [];
@@ -70,11 +109,16 @@ async function runTests() {
   };
 
   const token = 'test-secret-token-12345';
+  const mediaDownloads = [];
   const api = createApiServer({
     getSocket: () => mockSocket,
     token,
     store,
     logger: { log: () => {}, error: () => {} },
+    downloadMedia: async (message, mode) => {
+      mediaDownloads.push({ message, mode });
+      return Readable.from([Buffer.from('%PDF-test')]);
+    },
   });
 
   const { port } = await api.listen(0, '127.0.0.1');
@@ -93,6 +137,8 @@ async function runTests() {
     assert(spec.paths['/messages/send']);
     assert(spec.paths['/messages/reply']);
     assert(spec.paths['/messages/react']);
+    assert(spec.paths['/messages']);
+    assert(spec.paths['/chats/{chatId}/messages/{messageId}/media']);
     console.log('✓ OpenAPI endpoint passed');
 
     // 5. Test GET /docs (public)
@@ -179,7 +225,46 @@ async function runTests() {
     const msgsData = await msgsRes.json();
     assert.strictEqual(msgsData.messages.length, 1);
     assert.strictEqual(msgsData.messages[0].text, 'Hello from Alice via LID');
+    assert.strictEqual(Object.hasOwn(msgsData.messages[0], 'rawMessage'), false);
     console.log('✓ GET /chats/:chatId/messages passed');
+
+    const allMessagesUrl = `${baseUrl}/messages`;
+    assert.strictEqual((await fetch(allMessagesUrl)).status, 401);
+    const allMessages = await (await fetch(`${allMessagesUrl}?q=alice&since=999`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })).json();
+    assert.strictEqual(allMessages.messages.length, 1);
+    assert.strictEqual(allMessages.messages[0].id, 'msg_1');
+    assert.strictEqual(Object.hasOwn(allMessages.messages[0], 'rawMessage'), false);
+    assert.strictEqual((await fetch(`${allMessagesUrl}?since=bad`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })).status, 400);
+    console.log('✓ GET /messages search, authorization, and validation passed');
+
+    // Download only a retained media message, with authorization and safe response headers.
+    const mediaChat = '11223344@lid';
+    const mediaMessage = { documentMessage: { url: 'https://example.invalid/media', mediaKey: Buffer.alloc(32), fileName: '../work.pdf', mimetype: 'application/pdf', fileLength: 9 } };
+    store.recordMessage({ id: 'pdf_1', chatId: mediaChat, senderId: mediaChat, fromMe: false, type: 'document', rawMessage: mediaMessage });
+    const mediaUrl = `${baseUrl}/chats/${encodeURIComponent(mediaChat)}/messages/pdf_1/media`;
+    assert.strictEqual((await fetch(mediaUrl)).status, 401);
+    const mediaRes = await fetch(mediaUrl, { headers: { Authorization: `Bearer ${token}` } });
+    assert.strictEqual(mediaRes.status, 200);
+    assert.strictEqual(mediaRes.headers.get('content-type'), 'application/pdf');
+    assert.strictEqual(mediaRes.headers.get('content-disposition'), 'attachment; filename="work.pdf"');
+    assert.strictEqual(mediaRes.headers.get('cache-control'), 'no-store');
+    assert.strictEqual(Buffer.from(await mediaRes.arrayBuffer()).toString(), '%PDF-test');
+    assert.strictEqual(mediaDownloads.length, 1);
+    assert.strictEqual(mediaDownloads[0].mode, 'stream');
+    assert.deepStrictEqual(mediaDownloads[0].message.key, { remoteJid: mediaChat, id: 'pdf_1', fromMe: false });
+    assert.strictEqual(mediaDownloads[0].message.message, mediaMessage);
+    assert.strictEqual((await fetch(`${baseUrl}/chats/${encodeURIComponent(mediaChat)}/messages/missing/media`, { headers: { Authorization: `Bearer ${token}` } })).status, 404);
+    assert.strictEqual((await fetch(`${baseUrl}/chats/${encodeURIComponent(mediaChat)}/messages/msg_1/media`, { headers: { Authorization: `Bearer ${token}` } })).status, 415);
+    store.recordMessage({ id: 'huge', chatId: mediaChat, senderId: mediaChat, type: 'document', rawMessage: { documentMessage: { url: 'https://example.invalid/media', fileLength: 60 * 1024 * 1024 } } });
+    assert.strictEqual((await fetch(`${baseUrl}/chats/${encodeURIComponent(mediaChat)}/messages/huge/media`, { headers: { Authorization: `Bearer ${token}` } })).status, 413);
+    assert.strictEqual(mediaDownloads.length, 1);
+    for (let i = 0; i < 101; i++) store.recordMessage({ id: `later_${i}`, chatId: mediaChat, senderId: mediaChat, type: 'text', text: 'later' });
+    assert.strictEqual((await fetch(mediaUrl, { headers: { Authorization: `Bearer ${token}` } })).status, 404);
+    console.log('✓ Authenticated media download, limits, and eviction passed');
 
     // 12. Test POST /messages/send
     const sendRes = await fetch(`${baseUrl}/messages/send`, {

@@ -5,3 +5,8 @@ excluded-conversations.json
 .DS_Store
 *.log
 contacts-cache.json
+.api_token
+.discovery_secret
+.discovery.sqlite3*
+.runtime/
+chat-cache.sqlite3*

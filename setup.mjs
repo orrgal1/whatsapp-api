@@ -1,34 +1,21 @@
 import { spawn } from 'node:child_process';
-import crypto from 'node:crypto';
 import { constants as fsConstants, accessSync, readFileSync } from 'node:fs';
 import { rename, rm, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-import { Writable } from 'node:stream';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import { installService } from './service.mjs';
 
 const ROOT = fileURLToPath(new URL('./', import.meta.url));
 const CONFIG_PATH = fileURLToPath(new URL('./config.json', import.meta.url));
-const EXCLUDED_PATH = fileURLToPath(new URL('./excluded-conversations.json', import.meta.url));
 const CREDS_PATH = fileURLToPath(new URL('./.whatsapp-auth/creds.json', import.meta.url));
-const FORWARDER_PATH = fileURLToPath(new URL('./forwarder.mjs', import.meta.url));
+const SERVER_PATH = fileURLToPath(new URL('./server.mjs', import.meta.url));
 
-class PromptOutput extends Writable {
-  muted = false;
-
-  _write(chunk, encoding, callback) {
-    if (!this.muted) process.stdout.write(chunk, encoding);
-    callback();
-  }
-}
-
-function readExisting(path, fallback) {
+function readConfig() {
   try {
-    return JSON.parse(readFileSync(path, 'utf8'));
+    return JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT') return fallback;
-    throw new Error(`Could not read ${path}: ${error.message}`);
+    if (error.code === 'ENOENT') return {};
+    throw error;
   }
 }
 
@@ -42,37 +29,6 @@ async function writePrivateJson(filePath, value) {
   }
 }
 
-function commaSeparated(value) {
-  return [...new Set(value.split(',').map((item) => item.trim()).filter(Boolean))];
-}
-
-function displayList(values) {
-  return Array.isArray(values) ? values.join(', ') : '';
-}
-
-function resolveExecutable(command) {
-  if (command.includes(path.sep)) return command;
-  for (const directory of (process.env.PATH || '').split(path.delimiter)) {
-    if (!directory) continue;
-    const candidate = path.join(directory, command);
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {}
-  }
-  return command;
-}
-function requireExecutable(command) {
-  const resolved = resolveExecutable(command);
-  try {
-    accessSync(resolved, fsConstants.X_OK);
-    return resolved;
-  } catch {
-    throw new Error(`gapi executable not found or not executable: ${command}`);
-  }
-}
-
-
 function hasCredentials() {
   try {
     accessSync(CREDS_PATH, fsConstants.R_OK);
@@ -84,10 +40,7 @@ function hasCredentials() {
 
 async function runPairing() {
   await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [FORWARDER_PATH, '--pair-only'], {
-      cwd: ROOT,
-      stdio: 'inherit',
-    });
+    const child = spawn(process.execPath, [SERVER_PATH, '--pair-only'], { cwd: ROOT, stdio: 'inherit' });
     child.once('error', reject);
     child.once('exit', (code, signal) => {
       if (code === 0) resolve();
@@ -98,138 +51,24 @@ async function runPairing() {
 
 async function main() {
   if (process.platform !== 'darwin') throw new Error('Setup currently supports macOS only.');
-
-  const currentConfig = readExisting(CONFIG_PATH, {});
-  const currentExcluded = readExisting(EXCLUDED_PATH, { names: [], ids: [] });
-  const output = new PromptOutput();
-  const prompts = createInterface({ input: process.stdin, output, terminal: true });
-
-  const ask = async (label, defaultValue = '') => {
-    const suffix = defaultValue === '' ? '' : ` [${defaultValue}]`;
-    const answer = (await prompts.question(`${label}${suffix}: `)).trim();
-    return answer || String(defaultValue).trim();
-  };
-  const askRequired = async (label, defaultValue = '') => {
-    while (true) {
-      const answer = await ask(label, defaultValue);
-      if (answer) return answer;
-      console.log('A value is required.');
-    }
-  };
-  const askEmail = async (label, defaultValue = '') => {
-    while (true) {
-      const answer = await askRequired(label, defaultValue);
-      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer)) return answer;
-      console.log('Enter a valid email address (e.g. you@example.com).');
-    }
-  };
-  const askChoice = async (label, choices, defaultValue) => {
-    while (true) {
-      const answer = (await ask(`${label} (${choices.join('/')})`, defaultValue)).toLowerCase();
-      if (choices.includes(answer)) return answer;
-      console.log(`Choose ${choices.join(' or ')}.`);
-    }
-  };
-  const askBoolean = async (label, defaultValue) => {
-    const defaultText = defaultValue ? 'y' : 'n';
-    while (true) {
-      const answer = (await ask(`${label} (y/n)`, defaultText)).toLowerCase();
-      if (answer === 'y' || answer === 'yes') return true;
-      if (answer === 'n' || answer === 'no') return false;
-      console.log('Enter y or n.');
-    }
-  };
-  const askSecret = async (label, keepExisting) => {
-    const suffix = keepExisting ? ' (leave blank to keep existing)' : '';
-    process.stdout.write(`${label}${suffix}: `);
-    output.muted = true;
-    const answer = (await prompts.question('')).trim();
-    output.muted = false;
-    process.stdout.write('\n');
-    return answer;
-  };
-
-  console.log('WhatsApp Email Forwarder setup\n');
+  const config = readConfig();
+  const prompts = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  let port;
   try {
-    const destination = await askEmail('Forwarding email address', currentConfig.destination || '');
-    const existingType = currentConfig.delivery?.type === 'smtp' ? 'smtp' : 'gapi';
-    const deliveryType = await askChoice('Delivery method', ['gapi', 'smtp'], existingType);
-    let delivery;
-
-    if (deliveryType === 'gapi') {
-      const existingCommand = currentConfig.delivery?.type === 'gapi' ? currentConfig.delivery.command : '';
-      const suggestedCommand = resolveExecutable(existingCommand || 'gapi');
-      const command = requireExecutable(await askRequired('gapi executable path or command', suggestedCommand));
-      delivery = { type: 'gapi', command };
-    } else {
-      const existing = currentConfig.delivery?.type === 'smtp' ? currentConfig.delivery : {};
-      const host = await askRequired('SMTP host', existing.host || '');
-      let port;
-      while (!port) {
-        const candidate = Number(await askRequired('SMTP port', existing.port || 587));
-        if (Number.isInteger(candidate) && candidate >= 1 && candidate <= 65535) port = candidate;
-        else console.log('Enter a port from 1 to 65535.');
-      }
-      const secure = await askBoolean('Use implicit TLS', existing.secure ?? port === 465);
-      const user = await askRequired('SMTP username', existing.user || '');
-      let password = await askSecret('SMTP password', Boolean(existing.password));
-      if (!password) password = existing.password || '';
-      while (!password) {
-        console.log('A password is required.');
-        password = await askSecret('SMTP password', false);
-      }
-      delivery = { type: 'smtp', host, port, secure, user, password };
+    while (!port) {
+      const answer = (await prompts.question(`HTTP API port [${config.api?.port || 8080}]: `)).trim();
+      const candidate = Number(answer || config.api?.port || 8080);
+      if (Number.isInteger(candidate) && candidate >= 1 && candidate <= 65535) port = candidate;
+      else console.log('Enter a port from 1 to 65535.');
     }
-
-    const names = commaSeparated(await ask(
-      'Excluded conversation names (comma-separated, exact matches)',
-      displayList(currentExcluded.names),
-    ));
-    const ids = commaSeparated(await ask(
-      'Excluded conversation IDs (comma-separated, exact matches)',
-      displayList(currentExcluded.ids),
-    ));
-    const enableApi = await askBoolean('Enable HTTP API for chat interactions', currentConfig.api?.enabled ?? true);
-    let api = null;
-    if (enableApi) {
-      const defaultPort = currentConfig.api?.port || 8080;
-      let apiPort;
-      while (!apiPort) {
-        const candidate = Number(await askRequired('HTTP API port', defaultPort));
-        if (Number.isInteger(candidate) && candidate >= 1 && candidate <= 65535) apiPort = candidate;
-        else console.log('Enter a port from 1 to 65535.');
-      }
-      const existingToken = currentConfig.api?.token || '';
-      const generatedToken = existingToken || crypto.randomBytes(24).toString('hex');
-      const apiToken = await ask('HTTP API Bearer token', generatedToken);
-      api = {
-        enabled: true,
-        port: apiPort,
-        host: '127.0.0.1',
-        token: apiToken,
-      };
-    } else {
-      api = { enabled: false, port: 8080, host: '127.0.0.1', token: '' };
-    }
-
-
-    await writePrivateJson(CONFIG_PATH, { destination, delivery, api });
-    await writePrivateJson(EXCLUDED_PATH, { names, ids });
   } finally {
     prompts.close();
-    output.muted = false;
   }
-
-  console.log('\nConfiguration saved.');
-  if (hasCredentials()) {
-    console.log('Existing WhatsApp credentials found; pairing skipped.');
-  } else {
-    console.log('No WhatsApp credentials found. Starting device pairing…');
-    await runPairing();
-  }
-
+  await writePrivateJson(CONFIG_PATH, { api: { enabled: true, port, host: '127.0.0.1' } });
+  if (hasCredentials()) console.log('Existing WhatsApp pairing found.');
+  else await runPairing();
   await installService();
-  console.log('\nSetup complete.');
+  console.log('WhatsApp API setup complete.');
 }
 
 main().catch((error) => {

@@ -1,16 +1,82 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { URL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { chmodSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { downloadMediaMessage, extractMessageContent, getContentType } from '@whiskeysockets/baileys';
 
 const MAX_MESSAGES_PER_CHAT = 100;
 const MAX_CHATS = 500;
+const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
+const MEDIA_TYPES = new Set(['imageMessage', 'documentMessage', 'videoMessage', 'audioMessage', 'stickerMessage']);
+
+function mediaDetails(rawMessage) {
+  const content = extractMessageContent(rawMessage);
+  const type = content && getContentType(content);
+  if (!MEDIA_TYPES.has(type)) return null;
+  const media = content[type];
+  if (!media || typeof media !== 'object' || (!media.url && !media.thumbnailDirectPath)) return null;
+  const size = Number(media.fileLength?.toString());
+  return {
+    type,
+    media,
+    size: Number.isFinite(size) && size >= 0 ? size : null,
+  };
+}
+
+function safeMediaName(name, fallback) {
+  const base = String(name || '').split(/[\\/]/).pop();
+  return (base || fallback).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 150) || fallback;
+}
 
 export class ChatStore {
-  constructor() {
+  constructor({ databasePath = null } = {}) {
     this.chats = new Map(); // chatId -> { id, name, isGroup, phone, unreadCount, updatedAt, lastMessage }
     this.messages = new Map(); // chatId -> Array of message objects
     this.contacts = new Map(); // id -> { id, name, notify, verifiedName, phone }
     this.lidMap = new Map(); // lid -> jid/phone or jid/phone -> lid
+    this.database = null;
+    if (databasePath) {
+      mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+      this.database = new DatabaseSync(databasePath);
+      chmodSync(databasePath, 0o600);
+      this.database.exec(`
+        CREATE TABLE IF NOT EXISTS messages (
+          chat_id TEXT NOT NULL,
+          id TEXT NOT NULL,
+          sender_id TEXT NOT NULL,
+          sender_name TEXT NOT NULL,
+          from_me INTEGER NOT NULL,
+          timestamp INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          text TEXT NOT NULL,
+          PRIMARY KEY (chat_id, id)
+        );
+        CREATE INDEX IF NOT EXISTS messages_by_time ON messages(timestamp);
+      `);
+      this.saveMessage = this.database.prepare(`
+        INSERT INTO messages (chat_id, id, sender_id, sender_name, from_me, timestamp, type, text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, id) DO UPDATE SET
+          sender_id=excluded.sender_id, sender_name=excluded.sender_name,
+          from_me=excluded.from_me, timestamp=excluded.timestamp,
+          type=excluded.type, text=excluded.text
+      `);
+      this.pruneChat = this.database.prepare(`
+        DELETE FROM messages WHERE chat_id = ? AND id NOT IN (
+          SELECT id FROM messages WHERE chat_id = ? ORDER BY timestamp DESC, id DESC LIMIT ${MAX_MESSAGES_PER_CHAT}
+        )
+      `);
+      this.deleteChat = this.database.prepare('DELETE FROM messages WHERE chat_id = ?');
+      for (const row of this.database.prepare('SELECT * FROM messages ORDER BY timestamp, id').all()) {
+        this.recordMessage({
+          id: row.id, chatId: row.chat_id, senderId: row.sender_id,
+          senderName: row.sender_name, fromMe: Boolean(row.from_me),
+          timestamp: row.timestamp, type: row.type, text: row.text,
+        }, { persist: false });
+      }
+    }
   }
 
   extractPhone(jid) {
@@ -196,8 +262,8 @@ export class ChatStore {
     return results;
   }
 
-  recordMessage({ id, chatId, senderId, senderName, fromMe, timestamp, type, text, rawMessage }) {
-    if (!chatId) return;
+  recordMessage({ id, chatId, senderId, senderName, fromMe, timestamp, type, text, rawMessage }, { persist = true } = {}) {
+    if (!chatId || !id) return;
 
     if (senderName && senderId) {
       this.recordContact({
@@ -228,10 +294,9 @@ export class ChatStore {
       chatMessages[existingIndex] = msgObj;
     } else {
       chatMessages.push(msgObj);
-      if (chatMessages.length > MAX_MESSAGES_PER_CHAT) {
-        chatMessages.shift();
-      }
     }
+    chatMessages.sort((a, b) => a.timestamp - b.timestamp || a.id.localeCompare(b.id));
+    if (chatMessages.length > MAX_MESSAGES_PER_CHAT) chatMessages.splice(0, chatMessages.length - MAX_MESSAGES_PER_CHAT);
 
     const isGroup = chatId.endsWith('@g.us');
     const resolvedSenderName = senderName || this.resolveDisplayName(senderId, senderId.replace(/@.*/, ''));
@@ -258,20 +323,29 @@ export class ChatStore {
       existingChat.phone = resolvedPhone;
     }
 
-    existingChat.lastMessage = {
-      id,
-      text: text || `[${type}]`,
-      timestamp: msgObj.timestamp,
-      fromMe: msgObj.fromMe,
-    };
-    existingChat.updatedAt = msgObj.timestamp;
+    if (!existingChat.updatedAt || msgObj.timestamp >= existingChat.updatedAt) {
+      existingChat.lastMessage = {
+        id,
+        text: text || `[${type}]`,
+        timestamp: msgObj.timestamp,
+        fromMe: msgObj.fromMe,
+      };
+      existingChat.updatedAt = msgObj.timestamp;
+    }
 
     this.chats.set(chatId, existingChat);
 
-    if (this.chats.size > MAX_CHATS) {
+    while (this.chats.size > MAX_CHATS) {
       const oldestChatKey = this.chats.keys().next().value;
       this.chats.delete(oldestChatKey);
       this.messages.delete(oldestChatKey);
+      this.deleteChat?.run(oldestChatKey);
+    }
+
+    if (persist && this.database) {
+      this.saveMessage.run(chatId, id, msgObj.senderId, msgObj.senderName,
+        msgObj.fromMe ? 1 : 0, msgObj.timestamp, msgObj.type, msgObj.text);
+      this.pruneChat.run(chatId, chatId);
     }
   }
 
@@ -290,6 +364,12 @@ export class ChatStore {
     if (typeof isGroup === 'boolean') existing.isGroup = isGroup;
     if (resolvedPhone) existing.phone = resolvedPhone;
     this.chats.set(chatId, existing);
+    while (this.chats.size > MAX_CHATS) {
+      const oldestChatKey = this.chats.keys().next().value;
+      this.chats.delete(oldestChatKey);
+      this.messages.delete(oldestChatKey);
+      this.deleteChat?.run(oldestChatKey);
+    }
   }
 
   markRead(chatId) {
@@ -307,9 +387,26 @@ export class ChatStore {
     return msgs.slice(-count);
   }
 
+  listMessages({ chatId = '', q = '', since = 0, limit = 100 } = {}) {
+    const needle = String(q).trim().toLowerCase();
+    const after = Number(since) || 0;
+    const count = Math.min(Math.max(Number(limit) || 100, 1), 500);
+    const collections = chatId ? [this.messages.get(chatId) || []] : this.messages.values();
+    return Array.from(collections).flat()
+      .filter((message) => message.timestamp > after && (!needle || message.text.toLowerCase().includes(needle)))
+      .sort((a, b) => b.timestamp - a.timestamp || a.id.localeCompare(b.id))
+      .slice(0, count)
+      .map(({ rawMessage, ...message }) => message);
+  }
+
   getMessage(chatId, messageId) {
     const msgs = this.messages.get(chatId) || [];
     return msgs.find((m) => m.id === messageId);
+  }
+
+  close() {
+    this.database?.close();
+    this.database = null;
   }
 }
 
@@ -339,7 +436,7 @@ export function generateOpenApiSpec(serverUrl = '') {
           type: 'http',
           scheme: 'bearer',
           bearerFormat: 'Token',
-          description: 'Bearer token configured in config.json',
+          description: 'Bearer token supplied through SHARED_BEARER_TOKEN',
         },
       },
       schemas: {
@@ -504,6 +601,26 @@ export function generateOpenApiSpec(serverUrl = '') {
                 },
               },
             },
+          },
+        },
+      },
+      '/chats/{chatId}/messages/{messageId}/media': {
+        get: {
+          summary: 'Download retained message media',
+          description: 'Downloads media from a message with raw protocol data still held in memory (up to 100 messages per chat and 50 MiB per file). Media availability resets on restart.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'chatId', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'messageId', in: 'path', required: true, schema: { type: 'string' } },
+          ],
+          responses: {
+            200: { description: 'Media bytes', content: { 'application/octet-stream': { schema: { type: 'string', format: 'binary' } } } },
+            401: { description: 'Unauthorized' },
+            404: { description: 'Message not retained' },
+            415: { description: 'Message has no downloadable media' },
+            413: { description: 'Media exceeds 50 MiB limit' },
+            503: { description: 'WhatsApp client not connected' },
+            502: { description: 'WhatsApp media download failed' },
           },
         },
       },
@@ -716,6 +833,23 @@ export function generateOpenApiSpec(serverUrl = '') {
                 },
               },
             },
+          },
+        },
+      },
+      '/messages': {
+        get: {
+          summary: 'List or search retained messages across chats',
+          description: 'Returns up to 500 recent messages from the bounded local cache (up to 100 per chat), persisted across restarts without raw protocol data.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'chatId', in: 'query', schema: { type: 'string' } },
+            { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Case-insensitive text search' },
+            { name: 'since', in: 'query', schema: { type: 'integer' }, description: 'Only messages after this Unix time in milliseconds' },
+            { name: 'limit', in: 'query', schema: { type: 'integer', default: 100, maximum: 500 } },
+          ],
+          responses: {
+            200: { description: 'Recent matching messages', content: { 'application/json': { schema: { type: 'object', properties: { messages: { type: 'array', items: { $ref: '#/components/schemas/ChatMessage' } } } } } } },
+            401: { description: 'Unauthorized' },
           },
         },
       },
@@ -1041,6 +1175,7 @@ export function createApiServer({
   store = new ChatStore(),
   startTime = Date.now(),
   logger = console,
+  downloadMedia = downloadMediaMessage,
 }) {
   const openApiSpec = generateOpenApiSpec();
 
@@ -1182,13 +1317,96 @@ export function createApiServer({
         return;
       }
 
+      if (pathname === '/messages' && req.method === 'GET') {
+        const since = url.searchParams.get('since') || '0';
+        if (!/^\d+$/.test(since)) {
+          sendError(res, 400, 'since must be a Unix timestamp in milliseconds');
+          return;
+        }
+        sendJson(res, 200, { messages: store.listMessages({
+          chatId: url.searchParams.get('chatId') || '',
+          q: url.searchParams.get('q') || '',
+          since: Number(since),
+          limit: url.searchParams.get('limit') || 100,
+        }) });
+        return;
+      }
+
       // Chat messages: GET /chats/:chatId/messages
       const chatMessagesMatch = pathname.match(/^\/chats\/([^/]+)\/messages$/);
       if (chatMessagesMatch && req.method === 'GET') {
         const chatId = decodeURIComponent(chatMessagesMatch[1]);
         const limit = Number(url.searchParams.get('limit')) || 50;
         const messages = store.getMessages(chatId, limit);
-        sendJson(res, 200, { chatId, messages });
+        sendJson(res, 200, { chatId, messages: messages.map(({ rawMessage, ...message }) => message) });
+        return;
+      }
+
+      // Download media only while its source message remains in the bounded store.
+      const mediaMatch = pathname.match(/^\/chats\/([^/]+)\/messages\/([^/]+)\/media$/);
+      if (mediaMatch && req.method === 'GET') {
+        const chatId = decodeURIComponent(mediaMatch[1]);
+        const messageId = decodeURIComponent(mediaMatch[2]);
+        const message = store.getMessage(chatId, messageId);
+        if (!message) {
+          sendError(res, 404, 'Message not found in the in-memory store');
+          return;
+        }
+        const details = mediaDetails(message.rawMessage);
+        if (!details) {
+          sendError(res, 415, 'Message has no downloadable media');
+          return;
+        }
+        if (details.size > MAX_MEDIA_BYTES) {
+          sendError(res, 413, 'Media exceeds the 50 MiB download limit');
+          return;
+        }
+        const sock = getSocket ? getSocket() : null;
+        if (!sock?.user?.id) {
+          sendError(res, 503, 'WhatsApp client not connected');
+          return;
+        }
+
+        let chunks = [];
+        let total = 0;
+        try {
+          const source = await downloadMedia({
+            key: {
+              remoteJid: chatId,
+              id: messageId,
+              fromMe: message.fromMe,
+              ...(chatId.endsWith('@g.us') && message.senderId ? { participant: message.senderId } : {}),
+            },
+            message: message.rawMessage,
+          }, 'stream', {});
+          for await (const chunk of source) {
+            total += chunk.length;
+            if (total > MAX_MEDIA_BYTES) {
+              source.destroy?.();
+              sendError(res, 413, 'Media exceeds the 50 MiB download limit');
+              return;
+            }
+            chunks.push(chunk);
+          }
+        } catch (error) {
+          logger.error?.('[Media download error]', error?.name || 'unknown');
+          sendError(res, 502, 'WhatsApp media download failed');
+          return;
+        }
+        const data = Buffer.concat(chunks, total);
+        chunks = [];
+        const mime = String(details.media.mimetype || 'application/octet-stream');
+        const contentType = /^[\w.+-]+\/[\w.+-]+$/.test(mime) ? mime : 'application/octet-stream';
+        const fallback = `${messageId}.${details.type.replace('Message', '')}`;
+        const filename = safeMediaName(details.media.fileName, fallback);
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Content-Length': data.length,
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'no-store',
+        });
+        res.end(data);
         return;
       }
 
